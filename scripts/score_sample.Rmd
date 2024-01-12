@@ -1,0 +1,165 @@
+---
+title: "Compute DTP score for a sample"
+author: "Chaitra Sarathy"
+date: "2023-12-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load libraries 
+
+```{r}
+library(tidyverse)
+library(survival)
+library(survminer)
+library(ggrepel)
+library(sva)
+```
+
+Load annotation gtf file to map gene ids to symbols
+
+```{r}
+HUMAN_GTF_FILE_PATH = "gencode.v31.annotation.gtf"
+features <- rtracklayer::import(HUMAN_GTF_FILE_PATH)
+features_gene = as.data.frame(features)
+features_gene = features_gene[which(features_gene$type == "gene"),]
+keep <- c("gene_id", "gene_name")
+features_gene <- features_gene[, names(features_gene) %in% keep]
+rownames(features_gene) <- features_gene$gene_id
+```
+
+Define file names (as processed from OICR)
+
+```{r}
+# sample_counts_star <- "DTP_0002_Co_P_WT_1I.genes.results"
+# sName <- "OICR-CRC-002" 
+
+sample_counts_star <- "DTP_0003_Li_P_WT_2P.genes.results"
+sName <- "OICR-CRC-004" 
+```
+
+Import sample counts (as processed from OICR)
+
+```{r}
+s1 <- read.table(file = sample_counts_star, header = T)
+```
+
+Merge ids and symbols, collapse duplicated symbols
+
+```{r}
+# summarise expression for duplicated genes
+
+t1 <- s1 %>% dplyr::left_join(features_gene, "gene_id")
+
+exp.collapsed.mean <- t1 %>% dplyr::select(expected_count, TPM, FPKM, gene_name) %>%
+  na.omit() %>%
+  group_by(gene_name) %>%
+  summarise_all(mean) %>%
+  tibble::column_to_rownames('gene_name') %>%
+  as.matrix()
+
+head(rownames(exp.collapsed.mean))
+
+dim(exp.collapsed.mean)
+
+nrow(exp.collapsed.mean)
+
+sTab <- exp.collapsed.mean %>% as.data.frame() %>% dplyr::select(FPKM)
+colnames(sTab) <- sName
+```
+
+Read autophagy genes and load scoring functions
+```{r}
+gmtFile <- "geneset_autophagy.gmt"
+gs.autophagy <- clusterProfiler::read.gmt(file.path(getwd(), "geneset", gmtFile))
+autoGenes <- toupper(gs.autophagy$gene)
+
+source("0b_gsscoring_functions.R")
+source("0c_survival_functions.R")
+```
+
+Load TCGA matrix & merge new samples with count matrix from TCGA
+```{r}
+load("TCGA_COADREAD_GDC_annscaledcounts.RData")
+dim(tcga_coadread_ann)
+
+cgenes <- intersect(rownames(tcga_coadread_ann), rownames(sTab))
+
+mer.mat <- cbind(tcga_coadread_ann[rownames(tcga_coadread_ann) %in% cgenes,],
+                 sTab[rownames(sTab) %in% cgenes,])
+
+colnames(mer.mat)[ncol(mer.mat)] <- sName
+```
+
+batch correction
+
+```{r}
+library(sva)
+batch = c(rep("tcga", ncol(tcga_coadread_ann)),
+            rep("OICR", ncol(sTab)))
+# reference-batch version, with covariates
+combat_edata = ComBat(dat=mer.mat, batch=batch, mod=NULL)
+```
+
+zscore
+```{r}
+# mer.mat.zscored <- t(scale(t(mer.mat)))
+mer.mat.zscored <- t(scale(t(combat_edata)))
+tail(colnames(mer.mat.zscored))
+```
+
+compute score
+```{r}
+cohort = "Merged: TCGA-COAD-READ with Patient sample"
+autoScoreTab.go.wt <- compAutophagyScore(data.exprs.norm.z = mer.mat.zscored,
+                                      autoGenes = autoGenes, 
+                                      scoreType = "norm",
+                                      datasetID = cohort)
+autoScoreTab.go.wt$ap.score <- round(autoScoreTab.go.wt$ap.score, digits = 3)
+```
+
+```{r, fig.height=7, fig.width=7}
+s1 <- survivalAnalysis(survTab = survTab,
+                               sigScoreTab = autoScoreTab.go.wt,
+                               type = "autophagy", 
+                               method = "n",
+                               plotTitle = paste("TCGA: Scaled with ", sName, " (inherent)", sep=": "))
+
+s2 <- survivalAnalysis(survTab = survTab, 
+                               sigScoreTab = autoScoreTab.go.wt, 
+                               type = "autophagy", 
+                               method="xx",
+                               plotTitle = paste("TCGA: Scaled with ", sName, " (applied)", sep=": "),
+                               cutType="manual", 
+                               cutVal=0.126)
+s1$surv.plot
+s2$surv.plot
+```
+
+Plot score of OICR sample
+
+```{r, fig.height=7, fig.width=10}
+autoScoreTab.go.wt$ind = 1:nrow(autoScoreTab.go.wt)
+autoScoreTab.go.wt %>% ggplot(aes(y=ap.score, x=ind, label=sample)) +
+  geom_point(size=3, color=ifelse(autoScoreTab.go.wt$sample==sName, "red", "#006837"), alpha=0.6)+
+  geom_hline(yintercept = 0.126, size=1, col="red")+
+  xlab("") +
+  ylab(paste("Scores (TCGA samples with ", sName, " )", sep="")) +
+  geom_label_repel(aes(label = ifelse(autoScoreTab.go.wt$sample==sName, sName,'')),
+                  box.padding   = 0.5, 
+                  segment.color = 'grey50',
+                  max.overlaps = Inf)+
+  theme_classic() +
+  theme(plot.title = element_text(size=24, color="black"),
+        axis.title = element_text(size = 12, color="black"),
+        axis.text.x = element_text(angle = 0, size=12, hjust=1, color="black"),
+        axis.text.y = element_text(angle = 0, size=12, hjust=1, color="black"),
+        axis.title.x = element_text( size=14,  color="black"),
+        axis.title.y = element_text(size=14,  color="black"))
+```
+
+
+
